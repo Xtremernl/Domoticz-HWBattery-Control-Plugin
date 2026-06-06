@@ -1,5 +1,5 @@
 """
-<plugin key="HWBatteryControl" name="HomeWizard Battery Control" author="Christian" version="1.0.4">
+<plugin key="HWBatteryControl" name="HomeWizard Battery Control" author="Christian" version="1.0.6">
     <params>
         <param field="Address" label="IP Address" width="200px" required="true"/>
         <param field="Port" label="Port" width="75px" required="true" default="443"/>
@@ -29,16 +29,16 @@ import Domoticz
 import json
 import urllib.request
 import ssl
-import time
 
 class BasePlugin:
     def __init__(self):
-        self.poll_interval = 5
+        self.pluginInterval = 1
+        self.dataInterval = 5
+        self.dataIntervalCount = 0
         self.api_url = ""
         self.api_info_url = ""
         self.api_token = ""
         self.debug = False
-        self.lastPoll = 0
         self.is_modern = False
         self.last_permissions = []
 
@@ -47,9 +47,7 @@ class BasePlugin:
             Domoticz.Log("[DEBUG] " + msg)
 
     def onStart(self):
-        Domoticz.Log("HomeWizard Battery Control plugin started")
-
-        self.poll_interval = int(Parameters["Mode1"])
+        self.dataInterval = int(Parameters["Mode1"])
         self.api_token = Parameters["Password"]
         self.debug = Parameters["Mode6"] == "1"
 
@@ -59,13 +57,13 @@ class BasePlugin:
         self.api_url = f"https://{ip}:{port}/api/batteries"
         self.api_info_url = f"https://{ip}:{port}/api"
 
+        Domoticz.Log(f"HomeWizard Battery Control started, data interval = {self.dataInterval}s")
+        Domoticz.Heartbeat(self.pluginInterval)
+
         self._createDevices()
         self._detectApiVersion()
 
-        self.lastPoll = 0  # force immediate poll
-
     def _createDevices(self):
-        # Mode selector
         if 1 not in Devices:
             Domoticz.Device(
                 Name="Battery Mode",
@@ -81,8 +79,8 @@ class BasePlugin:
                 },
                 Description="Select the operating mode of the HomeWizard battery cluster."
             ).Create()
+            Devices[1].Update(nValue=0, sValue="0")
 
-        # Charge Allowed
         if 2 not in Devices:
             Domoticz.Device(
                 Name="Charge Allowed",
@@ -92,8 +90,7 @@ class BasePlugin:
                 Switchtype=0,
                 Description="Indicates whether the battery is allowed to charge."
             ).Create()
-            
-        # Discharge Allowed
+
         if 3 not in Devices:
             Domoticz.Device(
                 Name="Discharge Allowed",
@@ -104,7 +101,6 @@ class BasePlugin:
                 Description="Indicates whether the battery is allowed to discharge."
             ).Create()
 
-        # Power sensors
         if 10 not in Devices:
             Domoticz.Device(
                 Name="Total Power",
@@ -151,21 +147,19 @@ class BasePlugin:
             response = urllib.request.urlopen(req, timeout=5, context=context)
             data = json.loads(response.read().decode())
 
-            self.log("API info response:\n" + json.dumps(data, indent=2))
-
             api_version = data.get("api_version", "0.0.0")
             parts = tuple(map(int, api_version.split(".")))
             self.is_modern = parts >= (2, 3, 0)
-
-            self.log(f"Detected API version: {api_version} → modern={self.is_modern}")
 
         except Exception as e:
             Domoticz.Error(f"API version detection failed: {e}")
 
     def onHeartbeat(self):
-        if (self.lastPoll + self.poll_interval) <= time.time():
-            self.lastPoll = time.time()
+        if self.dataIntervalCount >= self.dataInterval:
+            self.dataIntervalCount = 0
             self._pollAPI()
+        else:
+            self.dataIntervalCount += 1
 
     def _pollAPI(self):
         try:
@@ -177,20 +171,16 @@ class BasePlugin:
             response = urllib.request.urlopen(req, timeout=5, context=context)
             data = json.loads(response.read().decode())
 
-            self.log("Battery data:\n" + json.dumps(data, indent=2))
-
             self._updateDevices(data)
 
         except Exception as e:
             Domoticz.Error(f"API error: {e}")
 
     def _updateDevices(self, data):
-        # --- Mode selector update ---
         mode = data.get("mode", "standby")
         charge_to_full = data.get("charge_to_full", False)
 
         level = 0
-
         if self.is_modern:
             if charge_to_full:
                 level = 30
@@ -211,36 +201,29 @@ class BasePlugin:
                 level = 30
 
         if Devices[1].sValue != str(level):
-            self.log(f"Updating mode selector → {level}")
             Devices[1].Update(nValue=0, sValue=str(level))
 
-        # --- Permissions ---
         perms = data.get("permissions", [])
         self.last_permissions = perms
 
         charge_on = "charge_allowed" in perms
         if Devices[2].nValue != (1 if charge_on else 0):
-            self.log(f"Updating Charge Allowed → {'On' if charge_on else 'Off'}")
             Devices[2].Update(1 if charge_on else 0, "On" if charge_on else "Off")
 
         discharge_on = "discharge_allowed" in perms
         if Devices[3].nValue != (1 if discharge_on else 0):
-            self.log(f"Updating Discharge Allowed → {'On' if discharge_on else 'Off'}")
             Devices[3].Update(1 if discharge_on else 0, "On" if discharge_on else "Off")
 
-        # --- Power sensors (update only when changed) ---
         def updateIfChanged(unit, newValue):
             if Devices[unit].sValue != str(newValue):
                 Devices[unit].Update(0, str(newValue))
 
-        updateIfChanged(10, int(data.get("power_w", 0)))
-        updateIfChanged(11, int(data.get("target_power_w", 0)))
-        updateIfChanged(12, int(data.get("max_consumption_w", 0)))
-        updateIfChanged(13, int(data.get("max_production_w", 0)))
+        updateIfChanged(10, round(float(data.get("power_w", 0)), 3))
+        updateIfChanged(11, round(float(data.get("target_power_w", 0)), 3))
+        updateIfChanged(12, round(float(data.get("max_consumption_w", 0)), 3))
+        updateIfChanged(13, round(float(data.get("max_production_w", 0)), 3))
 
     def onCommand(self, Unit, Command, Level, Color):
-        self.log(f"Command received: Unit={Unit}, Command={Command}, Level={Level}")
-
         if Unit == 1:
             self._handleMode(Level)
         elif Unit in (2, 3):
@@ -251,16 +234,13 @@ class BasePlugin:
 
         if Level == 0:
             payload = {"mode": "standby"}
-
         elif Level == 10:
             payload = {"mode": "zero"}
-
         elif Level == 20:
             if not self.is_modern:
                 Domoticz.Error("Predictive mode not supported on API < 2.3.0")
                 return
             payload = {"mode": "predictive"}
-
         elif Level == 30:
             if self.is_modern:
                 payload = {"charge_to_full": True}
@@ -294,8 +274,6 @@ class BasePlugin:
 
     def _put(self, payload):
         try:
-            self.log("PUT payload:\n" + json.dumps(payload, indent=2))
-
             req = urllib.request.Request(
                 self.api_url,
                 data=json.dumps(payload).encode(),
@@ -306,13 +284,9 @@ class BasePlugin:
             req.add_header("Content-Type", "application/json")
 
             context = ssl._create_unverified_context()
-            response = urllib.request.urlopen(req, timeout=5, context=context)
-            result = response.read().decode()
+            urllib.request.urlopen(req, timeout=5, context=context)
 
-            self.log("PUT response:\n" + result)
-
-            # Direct refresh
-            self._pollAPI()
+            self.dataIntervalCount = self.dataInterval
 
         except Exception as e:
             Domoticz.Error(f"PUT error: {e}")
