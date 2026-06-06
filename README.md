@@ -1,4 +1,4 @@
-# Domoticz-HWBattery-control-Plugin
+# Domoticz-HWBattery-Control-Plugin
 A Python plugin for Domoticz that creates several devices for the HomeWizard Battery Controller (P1 Device).
 
 The plugin configuration requires the ip of the P1 Device and a token.
